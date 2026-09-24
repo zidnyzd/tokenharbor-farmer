@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.jsonl
+*.log
+*.sqlite
+.tor*/
+# state & hasil farm (berisi kredensial akun + API key)
+th_state.json
+th_tor_state.json
+th_auto_results.jsonl
+accounts*.json
+accounts_full.txt
+api_keys.txt
+apikeys.txt
+th_accounts_export.txt
+# kredensial lokal
+.env
+proxy.env
+supabase_config.json

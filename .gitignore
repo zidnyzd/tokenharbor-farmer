@@ -15,3 +15,10 @@ api_keys.txt
 test_9router.sqlite
 .tor*/
 *.sqlite
+
+# --- tambahan fork ---
+local/th_state.json
+local/th_accounts_export.txt
+local/*.log
+local/diag*.json
+proxy.env
