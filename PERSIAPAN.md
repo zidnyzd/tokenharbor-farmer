@@ -7,12 +7,14 @@ CLI/TUI untuk bikin akun TokenHarbor (tokenharbor.ai) massal: signup → verify 
 consent free models → bikin 1 API key per akun → test → inject ke DB 9router. Repo mengklaim bypass
 rate-limit IP lewat rotasi exit node Tor (NEWNYM). Free tier: `deepseek-v4-flash:free`, `mimo-v2.5:free`, `qwen3.8-27b:free` (klaim repo).
 
+> **Penyamaran IP**: IP server & IP pihak ketiga disamarkan (mis. `103.xxx.xx`) — repo ini publik.
+
 ## 2. Hasil audit — repo TIDAK jalan apa adanya (diverifikasi, bukan asumsi)
 
 | # | Temuan | Bukti |
 |---|---|---|
 | A | **Next-Action ID + ACTION_KEY di repo sudah stale** → signup balas **HTTP 500** (`__next_error__`) | script vs halaman live: repo `6003703e…`/`kb59e6b8…` ; live `6086b863…` (signUp) & `6039ce3c…` (signIn), key `kcf78441…` |
-| B | **Semua exit node Tor ditolak TH** → `We couldn't create your account right now` | 6/6 percobaan, 6 exit IP berbeda (171.25.193.36, 109.70.100.15, 185.220.100.253, 193.189.100.203, 185.220.101.31, .101) |
+| B | **Semua exit node Tor ditolak TH** → `We couldn't create your account right now` | 6/6 percobaan, 6 exit IP berbeda (kelompok 171.x / 109.x / 185.x / 193.x) |
 | C | **IP server sendiri tembus** → signup `signedIn` (HTTP 303) | diag `direct` |
 | D | **Rate limit per IP nyata**: setelah 1-2 akun sukses muncul `Please complete the human check to continue.` (Turnstile) | farm run: akun #2 sukses, lalu 5x human-check berturut |
 | E | Tor di server ini **belum ada ControlPort** (hanya `SocksPort 0.0.0.0:9050`) → NEWNYM mustahil, dan 9050 ter-expose ke luar | `ss -lntp`, `torrc` |
@@ -54,8 +56,8 @@ rate-limit IP lewat rotasi exit node Tor (NEWNYM). Free tier: `deepseek-v4-flash
 
 | Jalur | Status | Bukti |
 |---|---|---|
-| **ipcook residensial/rotating** (sudah ada di 9router proxyPools: `geo.ipcook.com:32345`, akun `<PROXY_USER>`) | ✅✅ **TERBAIK** | 3/3 akun sukses berurutan, **tidak kena human-check**; exit IP rotasi tiap request (179.6.47.18 → 202.141.230.50 → 177.54.94.118); ippure: `isResidential: true`, fraudScore 40, ISP Converge ICT (PH) |
-| IP server sendiri (113.29.226.146) | ⚠️ terbatas | 2 akun lalu `Please complete the human check` |
+| **ipcook residensial/rotating** (sudah ada di 9router proxyPools: `geo.ipcook.com:32345`, akun `<PROXY_USER>`) | ✅✅ **TERBAIK** | 3/3 akun sukses berurutan, **tidak kena human-check**; exit IP rotasi tiap request (179.x.x.x → 202.x.x.x → 177.x.x.x); ippure: `isResidential: true`, fraudScore 40, ISP Converge ICT (PH) |
+| IP server sendiri (103.xxx.xx) | ⚠️ terbatas | 2 akun lalu `Please complete the human check` |
 | Tor | ❌ mati | 6/6 exit ditolak `We couldn't create your account` |
 | Airport lokal `127.0.0.1:7893` (cliproxy) | ❌ tidak jalan | port tidak listening |
 | Proxy publik monosans | ⛔ jangan | datacenter, cepat di-flag, berisiko |
