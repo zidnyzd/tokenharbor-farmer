@@ -13,9 +13,16 @@ Perbaikan atas repo Sekolah76/tokenharbor-farmer:
   5. Rotasi circuit NEWNYM + smart pause (dipertahankan dari repo).
 
 Usage:
-  python th_live.py single [--no-inject]
-  python th_live.py farm N [--no-inject] [--workers K]
+  python th_live.py single  [--no-inject] [--proxy URL | --direct | --tor] [--zira|--tempmail]
+  python th_live.py farm N  [--no-inject] [--workers K] [--proxy URL | --direct]
   python th_live.py status
+  python th_live.py cleanup        # buang akun unverified + conn-nya di 9router
+
+Ketahanan (perbaikan 25 Sep 2026, setelah run `farm 20` mati di tengah):
+  * req()  : semua request retry 3x dengan Sesi baru (IP baru) -> tidak crash
+  * anti-orphan: akun + key dicatat ke state SEGERA setelah key terbit
+  * email  : fallback otomatis tempmail.lol <-> mail.zira.web.id
+  * inject : hanya untuk akun terverifikasi (key unverified = 403)
 """
 import json, os, random, re, socket, sqlite3, string, sys, threading, time, urllib.parse, uuid
 from datetime import datetime, timezone
@@ -126,7 +133,85 @@ def scrape_action(sess):
     return aid, akey
 
 
+# Provider email: "tempmail" (default, pihak ketiga) atau "zira" (mail.zira.web.id sendiri).
+# tempmail.lol kena rate-limit setelah ratusan inbox → pakai milik sendiri kalau perlu.
+EMAIL_PROVIDER = os.environ.get("TH_EMAIL", "tempmail").strip().lower()
+
+
+class NetError(Exception):
+    """Kegagalan jaringan/proxy (transient) — bukan kesalahan logika."""
+
+
+def req(method, url, sess=None, tries=3, pause=4, rotate=True, **kw):
+    """Request tahan-error: retry dengan Sesi BARU (IP baru) bila kena error transient.
+
+    Ini menutup lubang yang membuat run `farm 20` mati total: satu ReadTimeout
+    pada POST /api/me/privacy melempar exception ke thread worker tanpa tertangkap.
+
+    Return requests.Response, atau None kalau semua percobaan gagal (pemanggil
+    memperlakukannya sebagai kegagalan akun biasa, bukan crash).
+    """
+    kw.setdefault("timeout", 40)
+    last = None
+    for i in range(tries):
+        try:
+            s = sess or requests.Session()
+            if sess is None:
+                s.headers.update({"User-Agent": UA})
+            return s.request(method, url, proxies=PX(), **kw)
+        except Exception as e:
+            last = e
+            transient = any(t in type(e).__name__ for t in
+                            ("Timeout", "ConnectionError", "ProxyError", "SSLError"))
+            log(f"  net retry {i+1}/{tries}: {type(e).__name__} {str(e)[:45]}", "WARN")
+            if i < tries - 1:
+                if rotate and not PROXY:
+                    newnym()
+                time.sleep(pause * (i + 1))
+    raise NetError(f"{type(last).__name__}: {str(last)[:70]}")
+
+
 def gen_email():
+    """Ambil inbox baru. Return (address, token).
+
+    Urutan provider: sesuai EMAIL_PROVIDER, lalu fallback otomatis ke provider
+    lain kalau yang utama rate-limit/gagal (tempmail.lol -> mail.zira).
+    """
+    order = ["tempmail", "zira"] if EMAIL_PROVIDER == "tempmail" else ["zira", "tempmail"]
+    for prov in order:
+        if prov == "zira":
+            try:
+                import mail_zira as M
+                addr, jwt = M.create_address()
+                if addr:
+                    if prov != EMAIL_PROVIDER:
+                        log(f"  email fallback -> mail.zira ({addr[:26]})", "WARN")
+                    return addr, jwt
+            except Exception as e:
+                log(f"  mail.zira err: {str(e)[:50]}", "WARN")
+        else:
+            for _ in range(2):
+                try:
+                    d = requests.post("https://api.tempmail.lol/v2/inbox/create", timeout=20).json()
+                    if d.get("address") and d.get("token"):
+                        return d["address"], d["token"]
+                except Exception as e:
+                    log(f"  tempmail err: {str(e)[:40]}", "WARN")
+                time.sleep(3)
+    return None, None
+
+
+def _gen_email_old():
+    """(arsip) implementasi lama — disimpan untuk referensi."""
+    if EMAIL_PROVIDER == "zira":
+        try:
+            import mail_zira as M
+            addr, tok = M.create_address()
+            if addr:
+                return addr, tok
+        except Exception as e:
+            log(f"mail.zira err: {str(e)[:50]}", "WARN")
+        return None, None
     for _ in range(4):
         try:
             d = requests.post("https://api.tempmail.lol/v2/inbox/create", timeout=20).json()
@@ -165,7 +250,17 @@ def make_body(aid, akey, email, pwd):
     return body, hdrs
 
 
-def verify_email(etok, max_wait=150):
+def verify_email(etok, max_wait=180, address=None, provider=None):
+    """Tunggu link verifikasi lalu klik. `etok` = token tempmail ATAU jwt mail.zira."""
+    prov = provider or EMAIL_PROVIDER
+    if prov == "zira" or (etok and etok.count(".") == 2 and not address):
+        # mail.zira: pakai jwt
+        try:
+            import mail_zira as M
+            return bool(M.find_verify_link(etok, max_wait=max_wait, proxies=PX()))
+        except Exception as e:
+            log(f"verify via mail.zira err: {str(e)[:50]}", "WARN")
+            return False
     start = time.time()
     while time.time() - start < max_wait:
         try:
@@ -176,13 +271,12 @@ def verify_email(etok, max_wait=150):
                     links = re.findall(r'(https://[^\s"<>\\]*verify[^\s"<>\\]*)', em.get("body", ""))
                 if links:
                     url = links[0].replace("&amp;", "&")
-                    try:
-                        requests.get(url, timeout=30, proxies=PX(), allow_redirects=True)
-                    except Exception:
+                    for px in (PX(), None):
                         try:
-                            requests.get(url, timeout=30, allow_redirects=True)
+                            requests.get(url, timeout=30, proxies=px, allow_redirects=True)
+                            return True
                         except Exception:
-                            pass
+                            continue
                     return True
         except Exception:
             pass
@@ -190,10 +284,17 @@ def verify_email(etok, max_wait=150):
     return False
 
 
-def register_one(use_tor=True):
+def register_one(use_tor=True, email_provider=None):
+    """Satu siklus pendaftaran.
+
+    PENTING (perbaikan): begitu akun dibuat + API key terbit, akun LANGSUNG
+    dicatat ke state (pending) SEBELUM langkah consent/verify. Sebelumnya state
+    disimpan di akhir, sehingga crash pada POST /api/me/privacy membuang akun
+    yang sudah jadi di sisi TokenHarbor (kasus consolata47ef3).
+    """
     email, etok = gen_email()
     if not email:
-        return None, "tempmail gagal"
+        return None, "email gagal (tempmail + mail.zira)"
     pwd = "".join(random.choices(string.ascii_letters + string.digits, k=12)) + "!Aa1"
     s = requests.Session()
     s.headers.update({"User-Agent": UA})
@@ -232,26 +333,50 @@ def register_one(use_tor=True):
                 pass
     except Exception:
         pass
-    r3 = s.post(f"{BASE}/api/keys", json={"label": f"th-{random.randint(1000,9999)}"},
-                headers={"Accept": "application/json", "Content-Type": "application/json"},
-                proxies=PX(), timeout=60)
-    if r3.status_code != 201:
-        return None, f"key create {r3.status_code}"
+    try:
+        r3 = req("POST", f"{BASE}/api/keys", sess=s, tries=3,
+                 json={"label": f"th-{random.randint(1000,9999)}"},
+                 headers={"Accept": "application/json", "Content-Type": "application/json"},
+                 timeout=60)
+    except NetError as e:
+        return None, f"key create net error: {str(e)[:50]}"
+    if r3 is None or r3.status_code != 201:
+        return None, f"key create {getattr(r3, 'status_code', 'no-resp')}"
     key = (r3.json() or {}).get("plaintext")
     if not key:
         return None, "no plaintext"
     log(f"  Key: {key[:28]}…")
-    rc = s.post(f"{BASE}/api/me/privacy", json={"free_models_enabled": True},
-                headers={"Accept": "application/json", "Content-Type": "application/json"},
-                proxies=PX(), timeout=40)
-    consent = rc.status_code == 200 and '"ok":true' in rc.text
-    log(f"  Free models consent: {'Y' if consent else 'N'} ({rc.status_code})")
+    # --- ANTI-ORPHAN: catat akun + key SEKARANG, sebelum langkah rawan ---
+    rec = {"email": email, "password": pwd, "userId": uid[0] if uid else "",
+           "api_key": key, "verified": False, "consent": False,
+           "state": "key_created", "injected": False,
+           "ts": datetime.now(timezone.utc).isoformat()}
+    _upsert_account(rec)
+    log("  akun dicatat (pending) — aman kalau langkah berikutnya gagal")
+
+    # consent (jangan sampai timeout mematikan worker)
+    consent = False
+    try:
+        rc = req("POST", f"{BASE}/api/me/privacy", sess=s, tries=3,
+                 json={"free_models_enabled": True},
+                 headers={"Accept": "application/json", "Content-Type": "application/json"},
+                 timeout=40)
+        if rc is not None:
+            consent = rc.status_code == 200 and '"ok":true' in rc.text
+            log(f"  Free models consent: {'Y' if consent else 'N'} ({rc.status_code})")
+    except Exception as e:
+        log(f"  consent gagal (dilewati): {str(e)[:50]}", "WARN")
     log("  Verify email…")
-    verified = verify_email(etok)
+    try:
+        verified = verify_email(etok, address=email, provider=email_provider)
+    except Exception as e:
+        log(f"  verify error: {str(e)[:50]}", "WARN")
+        verified = False
     log(f"  Verified: {'Y' if verified else 'N'}")
-    return {"email": email, "password": pwd, "userId": uid[0] if uid else "",
-            "api_key": key, "verified": verified, "consent": consent,
-            "ts": datetime.now(timezone.utc).isoformat()}, None
+    rec.update({"verified": verified, "consent": consent,
+                "state": "verified" if verified else "unverified"})
+    _upsert_account(rec)
+    return rec, None
 
 
 def test_model(key, model=None):
@@ -305,6 +430,29 @@ def inject(api_key, email):
         return False, str(e)[:80]
 
 
+def _upsert_account(rec):
+    """Tambah/perbarui akun di state berdasarkan email (atomik via lock)."""
+    with _lock:
+        st = {"accounts": []}
+        if os.path.exists(STATE):
+            try:
+                st = json.load(open(STATE))
+            except Exception:
+                st = {"accounts": []}
+        accs = st.setdefault("accounts", [])
+        for i, a in enumerate(accs):
+            if a.get("email") == rec.get("email"):
+                accs[i] = {**a, **rec}
+                break
+        else:
+            accs.append(rec)
+        tmp = STATE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(st, f, indent=2)
+        os.replace(tmp, STATE)
+    return rec
+
+
 def load_state():
     if os.path.exists(STATE):
         return json.load(open(STATE))
@@ -316,20 +464,34 @@ def save_state(st):
         json.dump(st, open(STATE, "w"), indent=2)
 
 
-def one_cycle(inject_on=True):
-    acct, err = register_one()
+def one_cycle(inject_on=True, email_provider=None):
+    try:
+        acct, err = register_one(email_provider=email_provider)
+    except NetError as e:
+        return None, f"net: {str(e)[:70]}"
+    except Exception as e:
+        # JANGAN biarkan satu akun mematikan seluruh run
+        return None, f"{type(e).__name__}: {str(e)[:70]}"
     if not acct:
         return None, err
-    ok, info = test_model(acct["api_key"])
-    acct["test"] = info
-    log(f"  Test model: {'OK' if ok else 'FAIL'} — {info}")
-    if inject_on:
-        inj, msg = inject(acct["api_key"], acct["email"])
-        acct["injected"] = inj
-        log(f"  Inject 9router: {'OK' if inj else 'FAIL'} — {msg}")
-    st = load_state()
-    st["accounts"].append(acct)
-    save_state(st)
+    try:
+        ok, info = test_model(acct["api_key"])
+        acct["test"] = info
+        log(f"  Test model: {'OK' if ok else 'FAIL'} — {info}")
+    except Exception as e:
+        log(f"  test model error: {str(e)[:50]}", "WARN")
+    # Inject HANYA kalau email terverifikasi (key unverified -> 403 di routing)
+    if inject_on and acct.get("verified"):
+        try:
+            inj, msg = inject(acct["api_key"], acct["email"])
+            acct["injected"] = inj
+            log(f"  Inject 9router: {'OK' if inj else 'FAIL'} — {msg}")
+        except Exception as e:
+            acct["injected"] = False
+            log(f"  inject error: {str(e)[:60]}", "WARN")
+    elif inject_on:
+        log("  Inject dilewati: email belum terverifikasi (key akan 403)", "WARN")
+    _upsert_account(acct)
     return acct, None
 
 
@@ -356,25 +518,47 @@ def cmd_farm(n, inject_on, workers=1):
 
     def worker(wid):
         fails = 0
+        mail_fails = 0
+        provider = EMAIL_PROVIDER
         while not stop.is_set():
             with lock:
                 if done["n"] >= target:
                     return
-            acct, err = one_cycle(inject_on)
+            try:
+                acct, err = one_cycle(inject_on, email_provider=provider)
+            except Exception as e:
+                acct, err = None, f"{type(e).__name__}: {str(e)[:70]}"
             if acct:
                 with lock:
                     done["n"] += 1
                     print(f"  ✅ [{done['n']}/{target}] {acct['email']} v:{'Y' if acct['verified'] else 'N'} "
                           f"inj:{'Y' if acct.get('injected') else 'N'} test:{acct.get('test')} (w{wid})", flush=True)
                 fails = 0
+                mail_fails = 0
                 time.sleep(random.randint(3, 8))
             else:
                 fails += 1
                 log(f"[w{wid}] gagal: {err}", "ERROR")
-                newnym(); time.sleep(random.randint(5, 12))
+                # deteksi rate-limit email -> langsung ganti provider (jangan pause 120s)
+                if "email gagal" in (err or ""):
+                    mail_fails += 1
+                    if mail_fails >= 3:
+                        provider = "zira" if provider == "tempmail" else "tempmail"
+                        log(f"[w{wid}] email provider bermasalah {mail_fails}x "
+                            f"-> ganti ke {provider}", "WARN")
+                        mail_fails = 0
+                        time.sleep(5)
+                        continue
+                else:
+                    mail_fails = 0
+                if not PROXY:
+                    newnym()
+                time.sleep(random.randint(5, 12))
                 if fails >= 5:
-                    log(f"[w{wid}] 5 gagal berturut — pause 120s + rotate", "WARN")
-                    newnym(); time.sleep(120); fails = 0
+                    log(f"[w{wid}] 5 gagal berturut — pause 60s + rotate", "WARN")
+                    if not PROXY:
+                        newnym()
+                    time.sleep(60); fails = 0
 
     threads = [threading.Thread(target=worker, args=(i + 1,), daemon=True) for i in range(workers)]
     for t in threads:
@@ -388,8 +572,14 @@ def cmd_farm(n, inject_on, workers=1):
     stop.set()
     for t in threads:
         t.join(timeout=10)
-    final = len(load_state()["accounts"])
-    print(f"=== SELESAI: total {final} akun di state ===")
+    final = load_state()["accounts"]
+    n_ver = sum(1 for a in final if a.get("verified"))
+    n_inj = sum(1 for a in final if a.get("injected"))
+    n_unver = sum(1 for a in final if not a.get("verified"))
+    print(f"=== SELESAI: total {len(final)} akun di state ===")
+    print(f"    verified: {n_ver} | injected: {n_inj} | belum verified: {n_unver}")
+    if n_unver:
+        print(f"    jalankan: ./venv/bin/python local/th_live.py cleanup   (buang akun unverified)")
     return 0
 
 
@@ -408,6 +598,41 @@ def cmd_status():
     return 0
 
 
+def cmd_cleanup():
+    """Buang akun yang belum terverifikasi dari state + hapus conn-nya di 9router."""
+    st = load_state()
+    accs = st.get("accounts", [])
+    unver = [a for a in accs if not a.get("verified")]
+    if not unver:
+        print("Tidak ada akun unverified. Bersih.")
+        return 0
+    keys = {a.get("api_key") for a in unver}
+    print(f"Akun unverified: {len(unver)}")
+    for a in unver:
+        print(f"  - {a.get('email')} ({a.get('state', '?')})")
+    try:
+        c = sqlite3.connect(DB, timeout=30)
+        cur = c.cursor()
+        rows = cur.execute("SELECT id,name,data FROM providerConnections "
+                           "WHERE data LIKE '%tokenharbor.ai%'").fetchall()
+        hapus = []
+        for cid, name, data in rows:
+            try:
+                if json.loads(data).get("apiKey") in keys:
+                    cur.execute("DELETE FROM providerConnections WHERE id=?", (cid,))
+                    hapus.append(name)
+            except Exception:
+                pass
+        c.commit(); c.close()
+        print(f"conn dihapus di 9router: {len(hapus)} -> {hapus}")
+    except Exception as e:
+        print(f"gagal hapus conn: {str(e)[:70]}")
+    st["accounts"] = [a for a in accs if a.get("verified")]
+    save_state(st)
+    print(f"state dibersihkan: {len(accs)} -> {len(st['accounts'])}")
+    return 0
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
     inj = "--no-inject" not in args
@@ -419,8 +644,14 @@ if __name__ == "__main__":
         i = args.index("--proxy")
         if i + 1 < len(args):
             globals()["PROXY"] = args[i + 1].strip()
+    if "--zira" in args:
+        globals()["EMAIL_PROVIDER"] = "zira"
+    elif "--tempmail" in args:
+        globals()["EMAIL_PROVIDER"] = "tempmail"
     if not args or args[0] == "status":
         sys.exit(cmd_status())
+    if args[0] == "cleanup":
+        sys.exit(cmd_cleanup())
     if args[0] == "single":
         sys.exit(cmd_single(inj))
     if args[0] == "farm":
